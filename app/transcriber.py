@@ -25,9 +25,11 @@ class Transcriber:
             "-m", self.model_path,
             "-f", audio_file,
             "-l", current_settings.language,
-            "-l", current_settings.language,
             "-nt"
         ]
+
+        if current_settings.initial_prompt:
+             cmd.extend(["--prompt", current_settings.initial_prompt])
 
         # Note: Current version of whisper-cli detects GPU automatically if DLLs are present.
         # -ngl option is invalid for this binary version.

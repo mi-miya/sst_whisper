@@ -15,6 +15,7 @@ class Settings(BaseModel):
     audio_device: Optional[int] = None
     sample_rate: int = 16000
     n_gpu_layers: int = 0
+    initial_prompt: str = ""
     sound_enabled: bool = True
 
     def resolve_paths(self):

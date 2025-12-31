@@ -1,7 +1,7 @@
 {
   "hotkey": "<ctrl>+<alt>+<shift>+j",
   "language": "ja",
-  "model_path": "./models/ggml-small.bin",
+  "model_path": "./models/ggml-medium.bin",
   "whisper_cli_path": "./bin/whisper-cli.exe",
   "auto_paste": false,
   "keep_trailing_newline": false,
@@ -9,5 +9,6 @@
   "audio_device": null,
   "sample_rate": 16000,
   "n_gpu_layers": 60,
+  "initial_prompt": "こんにちは。音声認識をします。",
   "sound_enabled": true
 }
