@@ -98,6 +98,7 @@ class FloatingWidget:
             short_text = "MIC"
             if state == "RECORDING": short_text = "REC"
             elif state == "TRANSCRIBING": short_text = "..."
+            elif state == "LOADING": short_text = "LOAD"
             self.canvas.itemconfig(self.text_id, text=short_text)
         except Exception as e:
             logger.error(f"GUI Error: {e}")

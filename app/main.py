@@ -161,27 +161,34 @@ class MainApp:
 
     def stop_and_transcribe(self):
         logger.info("Hotkey: Stop Recording")
-        audio_file = self.recorder.stop()
-        if not audio_file:
-            # Failed to record or short or silent
-            logger.info("Recording was silent or invalid. Returning to IDLE.")
-            sounds.play_cancel()
-            with self.lock:
-                self.state = IDLE
-                self.update_icon_state()
-            return
-
+        # 先に状態を遷移させてから、停止処理（配列結合・無音判定）ごと
+        # ワーカースレッドに逃がす。ホットキーの message loop を
+        # ブロックしないようにするため
         with self.lock:
             self.state = TRANSCRIBING
             self.update_icon_state()
 
-        # Run transcription in separate thread to not block hotkey listener
-        t = threading.Thread(target=self._transcribe_task, args=(audio_file,))
+        t = threading.Thread(target=self._transcribe_task)
         t.start()
 
-    def _transcribe_task(self, audio_file):
+    def _transcribe_task(self):
         try:
-            text = self.transcriber.transcribe(audio_file)
+            audio = self.recorder.stop()
+            if audio is None:
+                # Failed to record or short or silent
+                logger.info("Recording was silent or invalid. Returning to IDLE.")
+                sounds.play_cancel()
+                return
+
+            # モデルロード中なら待機中であることをGUIに表示
+            if not self.transcriber.is_ready():
+                logger.info("Model still loading, showing LOADING state...")
+                if self.gui:
+                    self.gui.set_state("LOADING", "orange")
+                self.transcriber.wait_until_ready()
+                self.update_icon_state()
+
+            text = self.transcriber.transcribe(audio)
             if text:
                 set_text(text)
                 if current_settings.auto_paste:
@@ -190,7 +197,6 @@ class MainApp:
             else:
                 sounds.play_cancel()
         finally:
-            self.recorder.cleanup_file(audio_file)
             with self.lock:
                 self.state = IDLE
                 self.update_icon_state()

@@ -1,8 +1,5 @@
-import os
 import re
-import tempfile
 import threading
-import numpy as np
 from .settings import current_settings
 from .logger import logger
 from .error_handler import show_error
@@ -50,20 +47,24 @@ class Transcriber:
         lang = extract_language_code(current_settings.language)
         language = lang if lang != "auto" else None
 
-        kwargs = {}
+        # faster-whisper は省略時 beam_size=5、temperature=[0.0〜1.0] の
+        # フォールバック探索が既定値のため、設定値を必ず明示的に渡す
+        kwargs = {
+            "beam_size": current_settings.beam_size,
+            "temperature": current_settings.temperature,
+            # 発話ごとに独立した文字起こしを行うため前セグメントへの
+            # 条件付けは無効化する（繰り返しハルシネーション対策も兼ねる）
+            "condition_on_previous_text": False,
+        }
         if current_settings.initial_prompt:
             kwargs["initial_prompt"] = current_settings.initial_prompt
-        if current_settings.beam_size != 1:
-            kwargs["beam_size"] = current_settings.beam_size
-        if current_settings.temperature > 0.0:
-            kwargs["temperature"] = current_settings.temperature
 
         return language, kwargs
 
     def _warmup_inference(self) -> None:
         """本番と同じコードパスを温める。
 
-        - WAV ファイル経由で PyAV のオーディオデコーダ初期化を済ませる
+        - 本番と同じ numpy 配列直接渡しで推論パスを温める
         - 本番と同じ initial_prompt / beam_size / temperature を使い
           CUDA カーネルの autotune を済ませる
         - 録音側ライブラリ (sounddevice / scipy) も同時にロードして
@@ -71,27 +72,17 @@ class Transcriber:
         """
         from .recorder import _lazy_import
 
-        _sd, np_mod, wav = _lazy_import()
+        _sd, np_mod, _wav = _lazy_import()
 
         sample_rate = 16000
-        # 完全な無音だと内部で短絡してデコーダ/デコーダパスが温まらないため、
+        # 完全な無音だと内部で短絡して推論パスが温まらないため、
         # 低振幅のホワイトノイズを 1 秒生成する
-        n_samples = sample_rate
-        audio = (np_mod.random.randn(n_samples) * 50).astype(np_mod.int16)
+        audio = (np_mod.random.randn(sample_rate) * (50.0 / 32768.0)).astype(np_mod.float32)
 
-        fd, tmp_path = tempfile.mkstemp(suffix=".wav", prefix="warmup_")
-        os.close(fd)
-        try:
-            wav.write(tmp_path, sample_rate, audio)
-            language, kwargs = self._build_transcribe_kwargs()
-            segments, _ = self._model.transcribe(tmp_path, language=language, **kwargs)
-            for _ in segments:
-                pass
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+        language, kwargs = self._build_transcribe_kwargs()
+        segments, _ = self._model.transcribe(audio, language=language, **kwargs)
+        for _ in segments:
+            pass
 
     def _load_model(self, device: str, device_index: int, compute_type: str) -> bool:
         """モデルをロードしウォームアップ推論を実行する"""
@@ -131,8 +122,10 @@ class Transcriber:
 
             device, device_index = self._parse_device()
             compute_type = current_settings.compute_type
-            if device == "cpu" and compute_type != "float32":
-                compute_type = "float32"
+            # CPUではfloat16系が使えない。float32へ落とすとint8の数倍遅いため、
+            # ユーザーが明示的にfloat32を選んだ場合以外はint8を使う
+            if device == "cpu" and compute_type not in ("int8", "float32"):
+                compute_type = "int8"
 
             try:
                 self._load_model(device, device_index, compute_type)
@@ -150,7 +143,7 @@ class Transcriber:
                     logger.warning("GPU error detected, falling back to CPU...")
                     self._model = None
                     try:
-                        self._load_model("cpu", 0, "float32")
+                        self._load_model("cpu", 0, "int8")
                         elapsed = time.time() - start_time
                         self._warmup_done = True
                         self._ready_event.set()
@@ -162,9 +155,17 @@ class Transcriber:
 
                 return False
 
-    def transcribe(self, audio_file: str) -> str:
-        """音声ファイルを文字起こしする"""
-        if not self._ready_event.wait(timeout=120):
+    def is_ready(self) -> bool:
+        """モデルのロードが完了しているかどうか"""
+        return self._ready_event.is_set()
+
+    def wait_until_ready(self, timeout: float = 120) -> bool:
+        """モデルのロード完了を待つ"""
+        return self._ready_event.wait(timeout=timeout)
+
+    def transcribe(self, audio) -> str:
+        """音声データ (float32 / 16kHz の numpy 配列) を文字起こしする"""
+        if not self.wait_until_ready():
             logger.error("Model not loaded after waiting. Warmup may have failed.")
             show_error("pipeline_not_loaded")
             return ""
@@ -175,7 +176,7 @@ class Transcriber:
 
         try:
             segments, info = self._model.transcribe(
-                audio_file,
+                audio,
                 language=language,
                 **kwargs,
             )
@@ -198,7 +199,7 @@ class Transcriber:
                 logger.warning("GPU OOM during transcription, falling back to CPU...")
                 try:
                     self._model = None
-                    self._load_model("cpu", 0, "float32")
+                    self._load_model("cpu", 0, "int8")
                     show_error("gpu_error", "GPUメモリ不足のため、CPUモードに切り替えました。")
                 except Exception:
                     show_error("gpu_error", error_msg[:200])

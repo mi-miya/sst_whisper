@@ -1,11 +1,11 @@
 # 遅延インポート用（メモリ最適化）
 # sounddevice, numpy, scipy は録音開始時に初めてインポートされる
-import tempfile
-import time
-from pathlib import Path
 from .settings import current_settings
 from .logger import logger
 from .error_handler import show_error
+
+# Whisperが要求するサンプルレート
+WHISPER_SAMPLE_RATE = 16000
 
 # グローバル変数（遅延インポート後に設定）
 _sd = None
@@ -34,36 +34,6 @@ class Recorder:
         self.sample_rate = current_settings.sample_rate
         self.channels = 1
         self.is_recording = False
-        self.temp_dir = Path(current_settings.temp_dir) if current_settings.temp_dir else Path(tempfile.gettempdir()) / "local_dictation"
-
-        # Ensure temp directory exists
-        try:
-            self.temp_dir.mkdir(parents=True, exist_ok=True)
-            logger.info(f"Temporary directory set to: {self.temp_dir}")
-            self._cleanup_old_files()
-        except Exception as e:
-            logger.error(f"Failed to create temp dir {self.temp_dir}: {e}")
-
-    def _cleanup_old_files(self):
-        """Delete temporary files older than 1 day."""
-        try:
-            now = time.time()
-            # 1 day in seconds
-            expiration = 24 * 60 * 60
-            count = 0
-            for f in self.temp_dir.glob("rec_*.wav"):
-                if f.is_file():
-                    mtime = f.stat().st_mtime
-                    if now - mtime > expiration:
-                        try:
-                            f.unlink()
-                            count += 1
-                        except Exception as e:
-                            logger.warn(f"Failed to delete old file {f}: {e}")
-            if count > 0:
-                logger.info(f"Cleaned up {count} old recording files.")
-        except Exception as e:
-            logger.error(f"Error during file cleanup: {e}")
 
     def callback(self, indata, frames, time, status):
         if status:
@@ -96,9 +66,15 @@ class Recorder:
             self.is_recording = False
             show_error("recording_failed", str(e))
 
-    def stop(self, discard=False) -> str:
+    def stop(self, discard=False):
+        """録音を停止し、Whisperにそのまま渡せる float32 / 16kHz の
+        numpy 配列を返す。破棄・無音・失敗時は None を返す。
+
+        WAVファイルへの書き出しは行わない（ディスクI/Oとデコードの
+        往復を省き、文字起こし開始までのレイテンシを削減するため）。
+        """
         if not self.is_recording:
-            return ""
+            return None
 
         try:
             # 遅延インポート
@@ -109,16 +85,18 @@ class Recorder:
             self.is_recording = False
             logger.info("Recording stopped")
 
+            frames = self.frames
+            self.frames = []
+
             if discard:
                 logger.info("Recording discarded")
-                self.frames = []  # clear frames
-                return ""
+                return None
 
-            if not self.frames:
+            if not frames:
                 logger.warning("No frames recorded")
-                return ""
+                return None
 
-            recording = np.concatenate(self.frames, axis=0)
+            recording = np.concatenate(frames, axis=0)
 
             # --- VAD Check ---
             # Calculate RMS amplitude
@@ -135,31 +113,26 @@ class Recorder:
             # 最大振幅チェック
             if max_amp < current_settings.silence_threshold:
                 logger.info(f"Audio ignored: Max amplitude too low ({max_amp:.2f} < {current_settings.silence_threshold})")
-                return ""
+                return None
 
             # RMSチェック：環境ノイズレベルを除外（人の声のRMSは通常600以上、キーボード音は200-300程度）
             noise_floor = current_settings.noise_floor
             if rms < noise_floor:
                 logger.info(f"Audio ignored: RMS too low ({rms:.2f} < {noise_floor}), likely background noise or keyboard")
-                return ""
+                return None
 
             # -----------------
 
-            timestamp = int(time.time() * 1000)
-            filename = self.temp_dir / f"rec_{timestamp}.wav"
+            # int16 -> float32 [-1.0, 1.0] に正規化し、1次元モノラルにする
+            audio = (float_data / 32768.0).reshape(-1)
 
-            wav.write(str(filename), self.sample_rate, recording)
-            logger.info(f"Saved audio to {filename}")
-            return str(filename)
-        except Exception as e:
-            logger.error(f"Failed to stop recording/save file: {e}")
-            return ""
+            # Whisperは16kHz前提のため、異なる場合はリサンプリング
+            if self.sample_rate != WHISPER_SAMPLE_RATE:
+                from scipy.signal import resample_poly
+                audio = resample_poly(audio, WHISPER_SAMPLE_RATE, self.sample_rate).astype(np.float32)
+                logger.info(f"Resampled audio from {self.sample_rate}Hz to {WHISPER_SAMPLE_RATE}Hz")
 
-    def cleanup_file(self, filepath: str):
-        try:
-            path = Path(filepath)
-            if path.exists():
-                path.unlink()
-                logger.debug(f"Deleted temp file: {filepath}")
+            return audio
         except Exception as e:
-            logger.error(f"Failed to delete file {filepath}: {e}")
+            logger.error(f"Failed to stop recording: {e}")
+            return None
