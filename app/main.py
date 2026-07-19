@@ -20,6 +20,30 @@ TRANSCRIBING = "TRANSCRIBING"
 
 VK_ESCAPE = 0x1B
 
+MUTEX_NAME = "LocalWhisperDictation_Mutex"
+ERROR_ALREADY_EXISTS = 183
+
+_mutex_handle = None
+
+
+def ensure_single_instance():
+    """二重起動を防止する。既に起動中ならメッセージを表示して終了する。"""
+    global _mutex_handle
+    _mutex_handle = ctypes.windll.kernel32.CreateMutexW(None, False, MUTEX_NAME)
+    if ctypes.windll.kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+        ctypes.windll.user32.MessageBoxW(
+            0, "音声入力ツールは既に起動しています。\nタスクトレイまたは画面上のアイコンを確認してください。",
+            "音声入力ツール", 0x40)
+        sys.exit(0)
+
+
+def release_single_instance():
+    """再起動時に新プロセスがミューテックスを取得できるよう解放する。"""
+    global _mutex_handle
+    if _mutex_handle:
+        ctypes.windll.kernel32.CloseHandle(_mutex_handle)
+        _mutex_handle = None
+
 class MainApp:
     def __init__(self):
         self.state = IDLE
@@ -221,6 +245,9 @@ class MainApp:
             except:
                 pass
 
+        # 新しいプロセスがミューテックスを取得できるよう先に解放する
+        release_single_instance()
+
         # 新しいプロセスを起動
         import subprocess
         subprocess.Popen([python, "-m", "app.main"], cwd=str(Path.cwd()))
@@ -255,6 +282,7 @@ def run_setup_wizard_and_start():
     def on_complete(settings):
         logger.info("Setup wizard completed, starting app...")
         # アプリを再起動（設定を反映するため）
+        release_single_instance()
         import subprocess
         subprocess.Popen([sys.executable, "-m", "app.main"], cwd=str(Path.cwd()))
         sys.exit(0)
@@ -268,6 +296,9 @@ def run_setup_wizard_and_start():
 
 
 if __name__ == "__main__":
+    # 二重起動チェック
+    ensure_single_instance()
+
     # 初回起動チェック
     if check_first_run():
         logger.info("First run detected, starting setup wizard...")
