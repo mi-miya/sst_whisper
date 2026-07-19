@@ -114,6 +114,8 @@ class Settings(BaseModel):
     temperature: float = 0.0
     silence_threshold: int = 500  # 発話/無音の判定閾値
     noise_floor: int = 200  # この振幅以下の音は無視
+    widget_x: Optional[int] = None  # フローティングアイコンの保存位置 (未設定なら画面左下)
+    widget_y: Optional[int] = None
 
     def resolve_paths(self):
         # Resolve relative paths
